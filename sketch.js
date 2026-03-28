@@ -215,7 +215,7 @@ class CartDP {
       this.t2  += (dt / 6) * (k1[4] + 2*k2[4] + 2*k3[4] + k4[4]);
       this.t2d += (dt / 6) * (k1[5] + 2*k2[5] + 2*k3[5] + k4[5]);
     }
-    if (Math.abs(this.x) > this.track) this.dead = true;
+    if (Math.abs(this.x) > this.track) { this.dead = true; this.xd = 0; this.x = Math.sign(this.x) * this.track; }
   }
   pixelPos() {
     let cx = this.x * PX_PER_M;
@@ -301,7 +301,7 @@ function nextGen() {
   avgFitHistory.push(avgFit);
 
   if (topFit > bestFit) { bestFit = topFit; bestGenome = new Float64Array(pop[0].g); }
-  if (topFit > allBestFit) { allBestFit = topFit; allBestGenome = new Float64Array(pop[0].g); }
+  if (topFit > allBestFit) { allBestFit = topFit; allBestGenome = new Float64Array(pop[0].g); resetDisplay(); }
 
   // Breed next generation
   let newPop = [];
@@ -342,7 +342,7 @@ function resetDisplay() {
 
 function stepDisplay() {
   if (!dispSim) return;
-  if (dispSim.dead || dispStep > PRESETS[currentPreset].steps) {
+  if (dispStep > PRESETS[currentPreset].steps) {
     resetDisplay();
     return;
   }
