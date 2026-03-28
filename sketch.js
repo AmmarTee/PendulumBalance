@@ -618,20 +618,8 @@ function drawHUD() {
   textSize(11);
   text(`Genome: ${GENOME_LEN} params  |  NN: ${NN_IN}-${NN_HID}-${NN_OUT}`, 30, yOff);
 
-  let ctrlY = height - 195;
-  fill(255, 255, 255, 60);
-  textSize(11);
-  textAlign(LEFT, BOTTOM);
-  text("[SPACE] Pause/Resume", 30, ctrlY);
-  text("[R] Reset current preset", 30, ctrlY + 18);
-  text("[1-5] Switch preset", 30, ctrlY + 36);
-  text("[T] Toggle trails", 30, ctrlY + 54);
-  text("[G] Toggle grid", 30, ctrlY + 72);
-  text("[N] Toggle NN view", 30, ctrlY + 90);
-  text(`[M] Sound: ${sfxEnabled ? "ON" : "OFF"}`, 30, ctrlY + 108);
-  text(`[+/-] Speed: ${speedMultiplier}x`, 30, ctrlY + 126);
-  text(`[V] Record: ${isRecording ? "REC" : "OFF"}`, 30, ctrlY + 144);
-  text(`Evals/frame: ${evalsPerFrame * speedMultiplier}`, 30, ctrlY + 162);
+  // Buttons drawn separately
+  drawButtonBar();
 
   if (isRecording) {
     textAlign(RIGHT, TOP);
@@ -719,6 +707,83 @@ function playImpact() {
 }
 
 // ============================================================
+//  Button UI
+// ============================================================
+const BTN_H = 28;
+const BTN_GAP = 4;
+const BTN_Y_OFF = 48;
+
+function getBtns() {
+  return [
+    { label: paused ? "PLAY" : "PAUSE", action: () => { paused = !paused; }, w: 46 },
+    { label: "RESET", action: () => { loadPreset(currentPreset); }, w: 44 },
+    { label: "1", action: () => loadPreset(0), w: 24, hi: currentPreset === 0 },
+    { label: "2", action: () => loadPreset(1), w: 24, hi: currentPreset === 1 },
+    { label: "3", action: () => loadPreset(2), w: 24, hi: currentPreset === 2 },
+    { label: "4", action: () => loadPreset(3), w: 24, hi: currentPreset === 3 },
+    { label: "5", action: () => loadPreset(4), w: 24, hi: currentPreset === 4 },
+    { label: "TRAIL", action: () => { showTrails = !showTrails; }, w: 42, hi: showTrails },
+    { label: "GRID", action: () => { showGrid = !showGrid; }, w: 38, hi: showGrid },
+    { label: "NN", action: () => { showNN = !showNN; }, w: 28, hi: showNN },
+    { label: "SFX", action: () => { sfxEnabled = !sfxEnabled; if (masterGain) masterGain.gain.value = sfxEnabled ? 0.35 : 0; }, w: 34, hi: sfxEnabled },
+    { label: "-", action: () => { speedMultiplier = max(speedMultiplier / 2, 0.25); }, w: 24 },
+    { label: `${speedMultiplier}x`, action: () => {}, w: 38 },
+    { label: "+", action: () => { speedMultiplier = min(speedMultiplier * 2, 16); }, w: 24 },
+    { label: isRecording ? "STOP" : "REC", action: () => { if (isRecording) stopRecording(); else startRecording(); }, w: 38, hi: isRecording },
+  ];
+}
+
+function drawButtonBar() {
+  let btns = getBtns();
+  let totalW = btns.reduce((s, b) => s + b.w + BTN_GAP, -BTN_GAP);
+  let sx = (width - totalW) / 2;
+  let y = height - BTN_Y_OFF;
+
+  noStroke();
+  fill(10, 12, 25, 190);
+  rect(sx - 10, y - 6, totalW + 20, BTN_H + 12, 8);
+
+  let x = sx;
+  textFont("monospace");
+  textSize(10);
+  textAlign(CENTER, CENTER);
+
+  for (let b of btns) {
+    if (b.hi) {
+      fill(255, 255, 255, 25);
+      stroke(255, 255, 255, 60);
+    } else {
+      fill(255, 255, 255, 8);
+      stroke(255, 255, 255, 25);
+    }
+    strokeWeight(1);
+    rect(x, y, b.w, BTN_H, 4);
+
+    noStroke();
+    fill(255, 255, 255, b.hi ? 200 : 130);
+    text(b.label, x + b.w / 2, y + BTN_H / 2);
+    x += b.w + BTN_GAP;
+  }
+}
+
+function handleBtnClick(mx, my) {
+  if (!audioStarted) initAudio();
+  let btns = getBtns();
+  let totalW = btns.reduce((s, b) => s + b.w + BTN_GAP, -BTN_GAP);
+  let sx = (width - totalW) / 2;
+  let y = height - BTN_Y_OFF;
+  let x = sx;
+  for (let b of btns) {
+    if (mx >= x && mx <= x + b.w && my >= y && my <= y + BTN_H) {
+      b.action();
+      return true;
+    }
+    x += b.w + BTN_GAP;
+  }
+  return false;
+}
+
+// ============================================================
 //  Recording
 // ============================================================
 function startRecording() {
@@ -797,5 +862,5 @@ function keyPressed() {
   if (key >= "1" && key <= "5") loadPreset(int(key) - 1);
 }
 
-function mousePressed() { if (!audioStarted) initAudio(); }
+function mousePressed() { if (!audioStarted) initAudio(); handleBtnClick(mouseX, mouseY); }
 function windowResized() { resizeCanvas(windowWidth, windowHeight); }
