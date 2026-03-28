@@ -199,7 +199,6 @@ class CartDP {
     return [xd, acc[0], t1d, acc[1], t2d, acc[2]];
   }
   step(force) {
-    if (this.dead) return;
     force = Math.max(-MAX_FORCE, Math.min(MAX_FORCE, force));
     let dt = PHYSICS_DT / PHYSICS_SUB;
     for (let s = 0; s < PHYSICS_SUB; s++) {
