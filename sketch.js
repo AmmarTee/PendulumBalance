@@ -33,7 +33,7 @@ let allBestGenome = null;
 let allBestFit = -Infinity;
 let fitHistory = [];
 let avgFitHistory = [];
-let evalsPerFrame = 3;
+let evalsPerFrame = 10;
 
 let dispSim = null;
 let dispNet = null;
@@ -341,7 +341,7 @@ function resetDisplay() {
 }
 
 function stepDisplay() {
-  if (!dispSim || !allBestGenome) return;
+  if (!dispSim) return;
   if (dispSim.dead || dispStep > PRESETS[currentPreset].steps) {
     resetDisplay();
     return;
