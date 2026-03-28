@@ -1,7 +1,8 @@
 // ============================================================
 //  PENDULUM BALANCE – p5.js neuroevolution simulation
 //  A neural network learns to balance an inverted double
-//  pendulum on a cart using a genetic algorithm
+//  pendulum on a cart using a genetic algorithm.
+//  Training runs in a Web Worker; this file handles display only.
 // ============================================================
 
 // --- Physics ---
@@ -12,42 +13,51 @@ const PHYSICS_SUB = 4;
 const MAX_FORCE = 60;
 
 // --- NN architecture ---
-const NN_IN = 8;   // x, xd, sin1, cos1, w1, sin2, cos2, w2
-const NN_HID = 12;
+const NN_IN = 8;
+const NN_HID1 = 24;
+const NN_HID2 = 16;
 const NN_OUT = 1;
-const GENOME_LEN = (NN_IN + 1) * NN_HID + (NN_HID + 1) * NN_OUT; // 121
+const GENOME_LEN = (NN_IN + 1) * NN_HID1 + (NN_HID1 + 1) * NN_HID2 + (NN_HID2 + 1) * NN_OUT;
 
-// --- GA ---
-let popSize = 30;
-const MUT_RATE = 0.15;
-const MUT_STD = 0.35;
-
-// --- State ---
-let pop = [];
+// --- GA state (received from worker) ---
+let popSize = 300;
 let gen = 0;
 let evalIdx = 0;
-let bestGenome = null;
-let bestFit = -Infinity;
 let allBestGenome = null;
 let allBestFit = -Infinity;
+let bestFit = -Infinity;
 let fitHistory = [];
 let avgFitHistory = [];
-let evalsPerFrame = 2;
-let trainBudgetMs = 8; // max ms to spend training per frame
+let totalEvals = 0;
+let trainElapsed = 0;
+let topGenomes = [];
 
+// --- Display ---
 let dispSim = null;
 let dispNet = null;
 let dispTrail = [];
 const TRAIL_LEN = 250;
 let dispStep = 0;
 
+// --- Secondary pendulums (top agents from population) ---
+let secSims = [];   // array of { sim: CartDP, net: NNet }
+let showAll = true;  // toggle with 'A' key
+
 let paused = false;
-let speedMultiplier = 1;
 let showTrails = true;
 let showGrid = true;
 let showNN = true;
 let currentPreset = 0;
 let time = 0;
+
+// --- Training activity tracking ---
+let lastWorkerMsgTime = 0;
+let prevEvalIdx = 0;
+let evalsPerSec = 0;
+let lastEvalCountTime = 0;
+
+// --- Worker ---
+let worker = null;
 
 // --- Audio ---
 let audioCtx = null;
@@ -87,64 +97,55 @@ const PRESETS = [
 // ============================================================
 class NNet {
   constructor(genome) {
-    this.g = genome || NNet.rand();
+    this.g = genome || new Float64Array(GENOME_LEN);
     this.parse();
-    this.lastH = new Float64Array(NN_HID);
+    this.lastH1 = new Float64Array(NN_HID1);
+    this.lastH2 = new Float64Array(NN_HID2);
     this.lastO = [0];
     this.lastIn = new Float64Array(NN_IN);
   }
   parse() {
     let i = 0, g = this.g;
     this.w1 = []; this.b1 = [];
-    for (let j = 0; j < NN_HID; j++) {
+    for (let j = 0; j < NN_HID1; j++) {
       this.w1[j] = [];
       for (let k = 0; k < NN_IN; k++) this.w1[j][k] = g[i++];
       this.b1[j] = g[i++];
     }
     this.w2 = []; this.b2 = [];
-    for (let j = 0; j < NN_OUT; j++) {
+    for (let j = 0; j < NN_HID2; j++) {
       this.w2[j] = [];
-      for (let k = 0; k < NN_HID; k++) this.w2[j][k] = g[i++];
+      for (let k = 0; k < NN_HID1; k++) this.w2[j][k] = g[i++];
       this.b2[j] = g[i++];
+    }
+    this.w3 = []; this.b3 = [];
+    for (let j = 0; j < NN_OUT; j++) {
+      this.w3[j] = [];
+      for (let k = 0; k < NN_HID2; k++) this.w3[j][k] = g[i++];
+      this.b3[j] = g[i++];
     }
   }
   forward(inp) {
     this.lastIn = inp;
-    for (let j = 0; j < NN_HID; j++) {
+    for (let j = 0; j < NN_HID1; j++) {
       let s = this.b1[j];
       for (let k = 0; k < NN_IN; k++) s += this.w1[j][k] * inp[k];
-      this.lastH[j] = Math.tanh(s);
+      this.lastH1[j] = Math.tanh(s);
+    }
+    for (let j = 0; j < NN_HID2; j++) {
+      let s = this.b2[j];
+      for (let k = 0; k < NN_HID1; k++) s += this.w2[j][k] * this.lastH1[k];
+      this.lastH2[j] = Math.tanh(s);
     }
     for (let j = 0; j < NN_OUT; j++) {
-      let s = this.b2[j];
-      for (let k = 0; k < NN_HID; k++) s += this.w2[j][k] * this.lastH[k];
+      let s = this.b3[j];
+      for (let k = 0; k < NN_HID2; k++) s += this.w3[j][k] * this.lastH2[k];
       this.lastO[j] = Math.tanh(s);
     }
     return this.lastO;
   }
-  static rand() {
-    let g = new Float64Array(GENOME_LEN);
-    for (let i = 0; i < GENOME_LEN; i++) g[i] = (Math.random() - 0.5) * 2;
-    return g;
-  }
-  static cross(a, b) {
-    let c = new Float64Array(GENOME_LEN);
-    let pt = Math.floor(Math.random() * GENOME_LEN);
-    for (let i = 0; i < GENOME_LEN; i++) c[i] = i < pt ? a[i] : b[i];
-    return c;
-  }
-  static mutate(g) {
-    let m = new Float64Array(g);
-    for (let i = 0; i < GENOME_LEN; i++) {
-      if (Math.random() < MUT_RATE) m[i] += gaussRand() * MUT_STD;
-    }
-    return m;
-  }
 }
 
-function gaussRand() {
-  return Math.sqrt(-2 * Math.log(Math.random())) * Math.cos(2 * Math.PI * Math.random());
-}
 
 // ============================================================
 //  Cart + Double Pendulum Physics
@@ -200,21 +201,40 @@ class CartDP {
   }
   step(force) {
     force = Math.max(-MAX_FORCE, Math.min(MAX_FORCE, force));
-    let dt = PHYSICS_DT / PHYSICS_SUB;
+    let sub_dt = PHYSICS_DT / PHYSICS_SUB;
+    // Semi-implicit Euler with substeps — must match worker physics exactly
     for (let s = 0; s < PHYSICS_SUB; s++) {
-      let st = [this.x, this.xd, this.t1, this.t1d, this.t2, this.t2d];
-      let k1 = this.derivs(st, force);
-      let k2 = this.derivs(st.map((v, i) => v + 0.5 * dt * k1[i]), force);
-      let k3 = this.derivs(st.map((v, i) => v + 0.5 * dt * k2[i]), force);
-      let k4 = this.derivs(st.map((v, i) => v + dt * k3[i]), force);
-      this.x   += (dt / 6) * (k1[0] + 2*k2[0] + 2*k3[0] + k4[0]);
-      this.xd  += (dt / 6) * (k1[1] + 2*k2[1] + 2*k3[1] + k4[1]);
-      this.t1  += (dt / 6) * (k1[2] + 2*k2[2] + 2*k3[2] + k4[2]);
-      this.t1d += (dt / 6) * (k1[3] + 2*k2[3] + 2*k3[3] + k4[3]);
-      this.t2  += (dt / 6) * (k1[4] + 2*k2[4] + 2*k3[4] + k4[4]);
-      this.t2d += (dt / 6) * (k1[5] + 2*k2[5] + 2*k3[5] + k4[5]);
+      let acc = this.derivsFlat(force);
+      this.xd  += acc[0] * sub_dt;
+      this.t1d += acc[1] * sub_dt;
+      this.t2d += acc[2] * sub_dt;
+      this.x   += this.xd * sub_dt;
+      this.t1  += this.t1d * sub_dt;
+      this.t2  += this.t2d * sub_dt;
     }
     if (Math.abs(this.x) > this.track) { this.dead = true; this.xd = 0; this.x = Math.sign(this.x) * this.track; }
+  }
+  derivsFlat(F) {
+    let { Mc, m1, m2, L1, L2, fric } = this;
+    let s1 = Math.sin(this.t1), c1 = Math.cos(this.t1);
+    let s2 = Math.sin(this.t2), c2 = Math.cos(this.t2);
+    let s12 = Math.sin(this.t1 - this.t2), c12 = Math.cos(this.t1 - this.t2);
+
+    let a00 = Mc + m1 + m2, a01 = (m1 + m2) * L1 * c1, a02 = m2 * L2 * c2;
+    let a10 = a01, a11 = (m1 + m2) * L1 * L1, a12 = m2 * L1 * L2 * c12;
+    let a20 = a02, a21 = a12, a22 = m2 * L2 * L2;
+
+    let b0 = F - fric * this.xd + (m1 + m2) * L1 * this.t1d * this.t1d * s1 + m2 * L2 * this.t2d * this.t2d * s2;
+    let b1 = (m1 + m2) * g_acc * L1 * s1 - m2 * L1 * L2 * this.t2d * this.t2d * s12;
+    let b2 = m2 * g_acc * L2 * s2 + m2 * L1 * L2 * this.t1d * this.t1d * s12;
+
+    let det = a00*(a11*a22-a12*a21) - a01*(a10*a22-a12*a20) + a02*(a10*a21-a11*a20);
+    if (Math.abs(det) < 1e-12) return [0, 0, 0];
+    let invDet = 1 / det;
+    let xdd  = (b0*(a11*a22-a12*a21) - a01*(b1*a22-a12*b2) + a02*(b1*a21-a11*b2)) * invDet;
+    let t1dd = (a00*(b1*a22-a12*b2) - b0*(a10*a22-a12*a20) + a02*(a10*b2-b1*a20)) * invDet;
+    let t2dd = (a00*(a11*b2-b1*a21) - a01*(a10*b2-b1*a20) + b0*(a10*a21-a11*a20)) * invDet;
+    return [xdd, t1dd, t2dd];
   }
   pixelPos() {
     let cx = this.x * PX_PER_M;
@@ -255,84 +275,48 @@ function solve3(A, b) {
 }
 
 // ============================================================
-//  Genetic Algorithm
+//  Worker communication
 // ============================================================
-function initPop() {
-  pop = [];
-  for (let i = 0; i < popSize; i++) pop.push({ g: NNet.rand(), fit: 0 });
-  gen = 0; evalIdx = 0;
-  bestFit = -Infinity; bestGenome = null;
-  allBestFit = -Infinity; allBestGenome = null;
-  fitHistory = []; avgFitHistory = [];
-}
+function initWorker() {
+  if (worker) worker.terminate();
+  worker = new Worker('worker.js');
+  worker.onmessage = function(e) {
+    let msg = e.data;
+    lastWorkerMsgTime = millis();
 
-function evalAgent(genome) {
-  let p = PRESETS[currentPreset];
-  let sim = new CartDP(p);
-  let net = new NNet(genome);
-  let totalR = 0;
-  for (let i = 0; i < p.steps; i++) {
-    if (sim.dead) break;
-    // Early termination if both arms have fallen past horizontal
-    if (Math.abs(sim.t1) > Math.PI * 0.75 && Math.abs(sim.t2) > Math.PI * 0.75) break;
-    let s = sim.state();
-    let out = net.forward(s);
-    sim.step(out[0] * MAX_FORCE);
-    totalR += sim.reward();
-  }
-  return totalR;
-}
-
-function trainBatch() {
-  let deadline = performance.now() + trainBudgetMs * speedMultiplier;
-  let count = 0;
-  while (performance.now() < deadline) {
-    if (evalIdx >= popSize) {
-      nextGen();
-      evalIdx = 0;
+    if (msg.type === "best") {
+      allBestGenome = new Float64Array(msg.genome);
+      allBestFit = msg.fit;
+      gen = msg.gen;
+      resetDisplay();
     }
-    pop[evalIdx].fit = evalAgent(pop[evalIdx].g);
-    evalIdx++;
-    count++;
-    if (count >= popSize) break; // at most one full gen per frame
-  }
-}
+    if (msg.type === "status") {
+      let prevIdx = evalIdx;
+      gen = msg.gen;
+      evalIdx = msg.evalIdx;
+      popSize = msg.popSize;
+      bestFit = msg.bestFit;
+      allBestFit = msg.allBestFit;
+      fitHistory = msg.fitHistory;
+      avgFitHistory = msg.avgFitHistory;
+      totalEvals = msg.totalEvals || 0;
+      trainElapsed = msg.elapsed || 0;
 
-function nextGen() {
-  pop.sort((a, b) => b.fit - a.fit);
-  let topFit = pop[0].fit;
-  let avgFit = pop.reduce((s, a) => s + a.fit, 0) / popSize;
-  fitHistory.push(topFit);
-  avgFitHistory.push(avgFit);
+      // Track evals per second using totalEvals
+      let now = millis();
+      if (now - lastEvalCountTime > 1000) {
+        evalsPerSec = (totalEvals - prevEvalIdx) / ((now - lastEvalCountTime) / 1000);
+        prevEvalIdx = totalEvals;
+        lastEvalCountTime = now;
+      }
 
-  if (topFit > bestFit) { bestFit = topFit; bestGenome = new Float64Array(pop[0].g); }
-  if (topFit > allBestFit) { allBestFit = topFit; allBestGenome = new Float64Array(pop[0].g); resetDisplay(); }
-
-  // Breed next generation
-  let newPop = [];
-  // Elitism
-  let elite = Math.max(2, Math.floor(popSize * 0.1));
-  for (let i = 0; i < elite; i++) newPop.push({ g: new Float64Array(pop[i].g), fit: 0 });
-  // Breed rest
-  while (newPop.length < popSize) {
-    let a = tournament(3);
-    let b = tournament(3);
-    let child = NNet.cross(pop[a].g, pop[b].g);
-    child = NNet.mutate(child);
-    newPop.push({ g: child, fit: 0 });
-  }
-  pop = newPop;
-  gen++;
-  bestFit = -Infinity;
-}
-
-function tournament(k) {
-  let best = Math.floor(Math.random() * popSize);
-  for (let i = 1; i < k; i++) {
-    let c = Math.floor(Math.random() * popSize);
-    if (pop[c].fit > pop[best].fit) best = c;
-  }
-  return best;
+      // Update secondary pendulums from top genomes
+      if (msg.topGenomes) {
+        topGenomes = msg.topGenomes;
+        rebuildSecondary();
+      }
+    }
+  };
 }
 
 // ============================================================
@@ -341,10 +325,30 @@ function tournament(k) {
 function resetDisplay() {
   let p = PRESETS[currentPreset];
   dispSim = new CartDP(p);
-  dispNet = new NNet(allBestGenome || NNet.rand());
+  dispNet = new NNet(allBestGenome || new Float64Array(GENOME_LEN));
   dispTrail = [];
   dispStep = 0;
+  rebuildSecondary();
 }
+
+function rebuildSecondary() {
+  let p = PRESETS[currentPreset];
+  secSims = [];
+  for (let i = 0; i < topGenomes.length; i++) {
+    let tg = topGenomes[i];
+    let sim = new CartDP(p);
+    // Sync initial state close to main sim
+    if (dispSim) {
+      sim.x = dispSim.x; sim.xd = dispSim.xd;
+      sim.t1 = dispSim.t1; sim.t1d = dispSim.t1d;
+      sim.t2 = dispSim.t2; sim.t2d = dispSim.t2d;
+    }
+    let net = new NNet(new Float64Array(tg.genome));
+    secSims.push({ sim, net, step: 0 });
+  }
+}
+
+
 
 function stepDisplay() {
   if (!dispSim) return;
@@ -359,6 +363,17 @@ function stepDisplay() {
   dispTrail.push({ x: pos.b2x, y: pos.b2y });
   if (dispTrail.length > TRAIL_LEN) dispTrail.shift();
   dispStep++;
+
+  // Step secondary pendulums
+  let maxSteps = PRESETS[currentPreset].steps;
+  for (let i = 0; i < secSims.length; i++) {
+    let sc = secSims[i];
+    if (sc.step > maxSteps || sc.sim.dead) continue;
+    let ss = sc.sim.state();
+    let so = sc.net.forward(ss);
+    sc.sim.step(so[0] * MAX_FORCE);
+    sc.step++;
+  }
 }
 
 // ============================================================
@@ -371,7 +386,7 @@ function drawPendulum() {
   let pivotY = height * 0.6;
 
   push();
-  translate(width * 0.38, pivotY);
+  translate(width * 0.42, pivotY);
 
   // Track
   let trackPx = p.track * PX_PER_M;
@@ -390,6 +405,40 @@ function drawPendulum() {
     strokeWeight(0.5);
     for (let gx = -trackPx; gx <= trackPx; gx += 50) line(gx, -300, gx, 50);
     for (let gy = -300; gy <= 50; gy += 50) line(-trackPx, gy, trackPx, gy);
+  }
+
+  // Secondary pendulums (ghost style)
+  if (showAll && secSims.length > 0) {
+    let ghostColors = [
+      [255, 150, 50], [50, 255, 180], [200, 100, 255], [255, 255, 80], [100, 200, 255]
+    ];
+    for (let gi = 0; gi < secSims.length; gi++) {
+      let sc = secSims[gi];
+      let gp = sc.sim.pixelPos();
+      let gc = ghostColors[gi % ghostColors.length];
+      let ga = 40; // ghost alpha
+
+      // Ghost cart
+      noStroke();
+      fill(gc[0], gc[1], gc[2], 15);
+      rect(gp.cx - 20, -6, 40, 12, 3);
+
+      // Ghost rod 1
+      stroke(gc[0], gc[1], gc[2], ga);
+      strokeWeight(1.5);
+      line(gp.cx, 0, gp.b1x, gp.b1y);
+
+      // Ghost rod 2
+      stroke(gc[0], gc[1], gc[2], ga * 0.8);
+      strokeWeight(1.2);
+      line(gp.b1x, gp.b1y, gp.b2x, gp.b2y);
+
+      // Ghost bobs
+      noStroke();
+      fill(gc[0], gc[1], gc[2], ga + 20);
+      ellipse(gp.b1x, gp.b1y, 6, 6);
+      ellipse(gp.b2x, gp.b2y, 6, 6);
+    }
   }
 
   // Trail
@@ -452,51 +501,97 @@ function drawPendulum() {
 
 function drawNNVis() {
   if (!showNN || !dispNet) return;
-  let nx = width - 230;
-  let ny = 80;
-  let layerGap = 85;
-  let nodeR = 8;
+
+  // Panel dimensions
+  let panelW = 280;
+  let panelH = 360;
+  let px = width - panelW - 20;
+  let py = 20;
+  let pad = 12;
+
+  // Panel background
+  noStroke();
+  fill(8, 10, 22, 210);
+  rect(px, py, panelW, panelH, 8);
+  stroke(255, 255, 255, 15);
+  strokeWeight(1);
+  noFill();
+  rect(px, py, panelW, panelH, 8);
+
+  // Title
+  noStroke();
+  fill(255, 255, 255, 50);
+  textFont("monospace");
+  textSize(9);
+  textAlign(CENTER, TOP);
+  text("NEURAL NETWORK  8-24-16-1", px + panelW / 2, py + 8);
+
+  // Layout inside panel: 4 columns
+  let innerX = px + pad;
+  let innerY = py + 26;
+  let usableW = panelW - pad * 2 - 16;
+  let layerGap = usableW / 3;
+  let nodeR = 4;
 
   let inLabels = ["x", "v", "s1", "c1", "w1", "s2", "c2", "w2"];
-  let inY = [], hidY = [], outY = [];
-  let inX = nx, hidX = nx + layerGap, outX = nx + layerGap * 2;
+  let inY = [], h1Y = [], h2Y = [], outY = [];
+  let inX = innerX + 12;
+  let h1X = innerX + 12 + layerGap;
+  let h2X = innerX + 12 + layerGap * 2;
+  let outX = innerX + 12 + layerGap * 3;
 
-  let inSpacing = 22;
-  let hidSpacing = 24;
-  let inStart = ny;
-  let hidStart = ny + (NN_IN * inSpacing - NN_HID * hidSpacing) / 2;
-  let outYpos = ny + (NN_IN * inSpacing) / 2;
+  let h1Spacing = 13;
+  let totalH = (NN_HID1 - 1) * h1Spacing;
+  let inSpacing = totalH / (NN_IN - 1);
+  let h2Spacing = totalH / (NN_HID2 - 1);
+  let inStart = innerY;
+  let h1Start = innerY;
+  let h2Start = innerY;
+  let outYpos = innerY + totalH / 2;
 
   for (let i = 0; i < NN_IN; i++) inY.push(inStart + i * inSpacing);
-  for (let i = 0; i < NN_HID; i++) hidY.push(hidStart + i * hidSpacing);
+  for (let i = 0; i < NN_HID1; i++) h1Y.push(h1Start + i * h1Spacing);
+  for (let i = 0; i < NN_HID2; i++) h2Y.push(h2Start + i * h2Spacing);
   outY.push(outYpos);
 
-  // Connections: input -> hidden
-  for (let j = 0; j < NN_HID; j++) {
+  // Connections: input -> hidden1
+  for (let j = 0; j < NN_HID1; j++) {
     for (let i = 0; i < NN_IN; i++) {
       let w = dispNet.w1[j][i];
-      let alpha = constrain(Math.abs(w) * 80, 5, 120);
-      let sw = constrain(Math.abs(w) * 1.5, 0.3, 2.5);
+      let alpha = constrain(Math.abs(w) * 35, 2, 45);
+      let sw = constrain(Math.abs(w) * 0.7, 0.12, 1.3);
       if (w > 0) stroke(80, 180, 255, alpha);
       else stroke(255, 80, 80, alpha);
       strokeWeight(sw);
-      line(inX + nodeR, inY[i], hidX - nodeR, hidY[j]);
+      line(inX + nodeR, inY[i], h1X - nodeR, h1Y[j]);
     }
   }
-  // Connections: hidden -> output
-  for (let j = 0; j < NN_HID; j++) {
-    let w = dispNet.w2[0][j];
-    let alpha = constrain(Math.abs(w) * 80, 5, 120);
-    let sw = constrain(Math.abs(w) * 1.5, 0.3, 2.5);
+  // Connections: hidden1 -> hidden2
+  for (let j = 0; j < NN_HID2; j++) {
+    for (let i = 0; i < NN_HID1; i++) {
+      let w = dispNet.w2[j][i];
+      let alpha = constrain(Math.abs(w) * 35, 2, 45);
+      let sw = constrain(Math.abs(w) * 0.7, 0.12, 1.3);
+      if (w > 0) stroke(80, 180, 255, alpha);
+      else stroke(255, 80, 80, alpha);
+      strokeWeight(sw);
+      line(h1X + nodeR, h1Y[i], h2X - nodeR, h2Y[j]);
+    }
+  }
+  // Connections: hidden2 -> output
+  for (let j = 0; j < NN_HID2; j++) {
+    let w = dispNet.w3[0][j];
+    let alpha = constrain(Math.abs(w) * 50, 3, 70);
+    let sw = constrain(Math.abs(w) * 1, 0.2, 2);
     if (w > 0) stroke(80, 180, 255, alpha);
     else stroke(255, 80, 80, alpha);
     strokeWeight(sw);
-    line(hidX + nodeR, hidY[j], outX - nodeR, outY[0]);
+    line(h2X + nodeR, h2Y[j], outX - nodeR, outY[0]);
   }
 
   noStroke();
   textFont("monospace");
-  textSize(9);
+  textSize(7);
   textAlign(RIGHT, CENTER);
 
   // Input nodes
@@ -505,49 +600,87 @@ function drawNNVis() {
     let bright = constrain(map(Math.abs(v), 0, 1, 60, 220), 60, 220);
     fill(bright, bright, bright, 180);
     ellipse(inX, inY[i], nodeR * 2, nodeR * 2);
-    fill(255, 255, 255, 70);
-    text(inLabels[i], inX - nodeR - 3, inY[i]);
+    fill(255, 255, 255, 50);
+    text(inLabels[i], inX - nodeR - 1, inY[i]);
   }
 
-  // Hidden nodes
+  // Hidden1 nodes
   textAlign(CENTER, CENTER);
-  for (let j = 0; j < NN_HID; j++) {
-    let v = dispNet.lastH ? dispNet.lastH[j] : 0;
+  for (let j = 0; j < NN_HID1; j++) {
+    let v = dispNet.lastH1 ? dispNet.lastH1[j] : 0;
     let r = v > 0 ? 60 : 255;
     let g = v > 0 ? 200 : 80;
     let b = v > 0 ? 255 : 80;
     let alpha = constrain(Math.abs(v) * 200 + 40, 40, 220);
     fill(r, g, b, alpha);
-    ellipse(hidX, hidY[j], nodeR * 2, nodeR * 2);
+    ellipse(h1X, h1Y[j], nodeR * 2, nodeR * 2);
+  }
+
+  // Hidden2 nodes
+  for (let j = 0; j < NN_HID2; j++) {
+    let v = dispNet.lastH2 ? dispNet.lastH2[j] : 0;
+    let r = v > 0 ? 60 : 255;
+    let g = v > 0 ? 200 : 80;
+    let b = v > 0 ? 255 : 80;
+    let alpha = constrain(Math.abs(v) * 200 + 40, 40, 220);
+    fill(r, g, b, alpha);
+    ellipse(h2X, h2Y[j], nodeR * 2, nodeR * 2);
   }
 
   // Output node
   let ov = dispNet.lastO ? dispNet.lastO[0] : 0;
   let oColor = ov > 0 ? [80, 255, 130] : [255, 130, 80];
   fill(oColor[0], oColor[1], oColor[2], 200);
-  ellipse(outX, outY[0], nodeR * 2.5, nodeR * 2.5);
+  ellipse(outX, outY[0], nodeR * 3, nodeR * 3);
   fill(255, 255, 255, 100);
-  textSize(8);
+  textSize(6);
   text("F", outX, outY[0]);
-
-  // Label
-  fill(255, 255, 255, 50);
-  textSize(10);
-  textAlign(CENTER, TOP);
-  text("NEURAL NETWORK", nx + layerGap, ny - 20);
 }
 
 function drawFitnessGraph() {
-  let gw = 200, gh = 70;
-  let gx = width - gw - 30;
-  let gy = height - gh - 30;
+  let panelW = 280;
+  let gw = panelW;
+  let gh = 140;
+  let gx = width - panelW - 20;
+  let gy = 390;
 
-  fill(10, 12, 25, 200);
-  stroke(255, 25);
+  // Panel background
+  noStroke();
+  fill(8, 10, 22, 210);
+  rect(gx, gy, gw, gh, 8);
+  stroke(255, 255, 255, 15);
   strokeWeight(1);
-  rect(gx, gy, gw, gh, 4);
+  noFill();
+  rect(gx, gy, gw, gh, 8);
 
-  if (fitHistory.length < 2) return;
+  noStroke();
+  fill(255, 255, 255, 50);
+  textFont("monospace");
+  textSize(9);
+  textAlign(CENTER, TOP);
+  text("FITNESS / GENERATION", gx + gw / 2, gy + 8);
+
+  if (fitHistory.length < 2) {
+    fill(255, 255, 255, 30);
+    textSize(10);
+    textAlign(CENTER, CENTER);
+    text("Waiting for data...", gx + gw / 2, gy + gh / 2 + 8);
+
+    // Show a loading animation
+    let isTraining = (millis() - lastWorkerMsgTime) < 500;
+    if (isTraining) {
+      let dotCount = Math.floor(frameCount / 20) % 4;
+      fill(80, 255, 120, 60);
+      text("Training" + ".".repeat(dotCount), gx + gw / 2, gy + gh / 2 + 24);
+    }
+    return;
+  }
+
+  let pad = 14;
+  let chartX = gx + pad + 20; // Extra room for y-axis labels
+  let chartY = gy + 24;
+  let chartW = gw - pad * 2 - 20;
+  let chartH = gh - 50;
 
   let data = fitHistory.slice(-80);
   let avg = avgFitHistory.slice(-80);
@@ -556,93 +689,309 @@ function drawFitnessGraph() {
   let maxR = Math.max(...allData);
   if (maxR - minR < 1) maxR = minR + 1;
 
+  // Y-axis labels
+  textSize(7);
+  textAlign(RIGHT, CENTER);
+  fill(255, 255, 255, 40);
+  text(maxR.toFixed(0), chartX - 4, chartY);
+  text(((maxR + minR) / 2).toFixed(0), chartX - 4, chartY + chartH / 2);
+  text(minR.toFixed(0), chartX - 4, chartY + chartH);
+
+  // Horizontal grid lines
+  stroke(255, 255, 255, 8);
+  strokeWeight(0.5);
+  line(chartX, chartY, chartX + chartW, chartY);
+  line(chartX, chartY + chartH / 2, chartX + chartW, chartY + chartH / 2);
+  line(chartX, chartY + chartH, chartX + chartW, chartY + chartH);
+
+  // Average line (filled area)
+  noStroke();
+  fill(255, 255, 255, 8);
+  beginShape();
+  for (let i = 0; i < avg.length; i++) {
+    let px = chartX + (i / (avg.length - 1)) * chartW;
+    let py = chartY + chartH - ((avg[i] - minR) / (maxR - minR)) * chartH;
+    vertex(px, py);
+  }
+  vertex(chartX + chartW, chartY + chartH);
+  vertex(chartX, chartY + chartH);
+  endShape(CLOSE);
+
   // Average line
   noFill();
-  stroke(255, 255, 255, 40);
+  stroke(255, 255, 255, 50);
   strokeWeight(1);
   beginShape();
   for (let i = 0; i < avg.length; i++) {
-    let px = gx + 10 + (i / (avg.length - 1)) * (gw - 20);
-    let py = gy + gh - 10 - ((avg[i] - minR) / (maxR - minR)) * (gh - 20);
+    let px = chartX + (i / (avg.length - 1)) * chartW;
+    let py = chartY + chartH - ((avg[i] - minR) / (maxR - minR)) * chartH;
     vertex(px, py);
   }
   endShape();
 
   // Best line
-  stroke(120, 255, 120, 150);
+  stroke(120, 255, 120, 180);
   strokeWeight(1.5);
   beginShape();
   for (let i = 0; i < data.length; i++) {
-    let px = gx + 10 + (i / (data.length - 1)) * (gw - 20);
-    let py = gy + gh - 10 - ((data[i] - minR) / (maxR - minR)) * (gh - 20);
+    let px = chartX + (i / (data.length - 1)) * chartW;
+    let py = chartY + chartH - ((data[i] - minR) / (maxR - minR)) * chartH;
     vertex(px, py);
   }
   endShape();
 
+  // Mark the current best point
+  if (data.length > 0) {
+    let lastX = chartX + chartW;
+    let lastY = chartY + chartH - ((data[data.length - 1] - minR) / (maxR - minR)) * chartH;
+    noStroke();
+    fill(120, 255, 120, 200);
+    ellipse(lastX, lastY, 5, 5);
+  }
+
+  // X-axis generation labels
   noStroke();
+  fill(255, 255, 255, 35);
+  textSize(7);
+  textAlign(CENTER, TOP);
+  let startGen = Math.max(0, gen - data.length);
+  text("Gen " + startGen, chartX, chartY + chartH + 4);
+  text("Gen " + gen, chartX + chartW, chartY + chartH + 4);
+
+  // Legend
+  textSize(8);
+  textAlign(LEFT, BOTTOM);
+  fill(120, 255, 120, 150);
+  ellipse(gx + pad + 2, gy + gh - 6, 4, 4);
+  text("BEST: " + data[data.length - 1].toFixed(0), gx + pad + 8, gy + gh - 2);
   fill(255, 255, 255, 60);
-  textFont("monospace");
-  textSize(9);
-  textAlign(LEFT, TOP);
-  text("Fitness / Gen", gx + 6, gy + 4);
+  let avgX = gx + gw / 2 + 10;
+  ellipse(avgX - 6, gy + gh - 6, 4, 4);
+  text("AVG: " + avg[avg.length - 1].toFixed(0), avgX, gy + gh - 2);
+
+  // Improvement indicator
+  if (data.length >= 2) {
+    let delta = data[data.length - 1] - data[data.length - 2];
+    if (Math.abs(delta) > 0.1) {
+      textAlign(RIGHT, BOTTOM);
+      if (delta > 0) {
+        fill(80, 255, 120, 120);
+        text("+" + delta.toFixed(1), gx + gw - pad, gy + gh - 2);
+      } else {
+        fill(255, 80, 80, 80);
+        text(delta.toFixed(1), gx + gw - pad, gy + gh - 2);
+      }
+    }
+  }
 }
 
 function drawHUD() {
-  fill(255, 255, 255, 200);
+  let px = 20;
+  let py = 20;
+  let panelW = 280;
+
+  // --- Title bar ---
   noStroke();
+  fill(8, 10, 22, 210);
+  rect(px, py, panelW, 42, 8);
+  stroke(255, 255, 255, 15);
+  strokeWeight(1);
+  noFill();
+  rect(px, py, panelW, 42, 8);
+
+  noStroke();
+  fill(255, 255, 255, 220);
   textFont("monospace");
-  textSize(22);
-  textAlign(LEFT, TOP);
-  text("PENDULUM BALANCE", 30, 25);
+  textSize(16);
+  textAlign(LEFT, CENTER);
+  text("PENDULUM BALANCE", px + 14, py + 21);
 
-  textSize(14);
-  fill(255, 255, 255, 120);
-  text(`Preset: ${PRESETS[currentPreset].name}`, 30, 55);
+  // --- Training status indicator ---
+  let isTraining = (millis() - lastWorkerMsgTime) < 500;
+  let trainY = py + 52;
+  let trainH = 32;
 
-  textSize(13);
-  fill(255, 255, 255, 100);
-  text(`Generation: ${gen}`, 30, 78);
+  noStroke();
+  fill(8, 10, 22, 210);
+  rect(px, trainY, panelW, trainH, 8);
+  stroke(255, 255, 255, 15);
+  strokeWeight(1);
+  noFill();
+  rect(px, trainY, panelW, trainH, 8);
 
-  let yOff = 105;
-  textSize(12);
+  noStroke();
+  textSize(11);
+  textAlign(LEFT, CENTER);
 
-  fill(255, 255, 255, 120);
-  text(`Population: ${popSize}  |  Eval: ${evalIdx}/${popSize}`, 30, yOff); yOff += 20;
-  fill(120, 255, 120, 150);
-  text(`Best (gen): ${bestFit > -Infinity ? bestFit.toFixed(1) : "---"}`, 30, yOff); yOff += 18;
-  fill(255, 200, 50, 150);
-  text(`Best (all): ${allBestFit > -Infinity ? allBestFit.toFixed(1) : "---"}`, 30, yOff); yOff += 18;
-
-  if (dispSim) {
-    let bal = ((1 + Math.cos(dispSim.t1)) / 2 + (1 + Math.cos(dispSim.t2)) / 2).toFixed(2);
-    fill(255, 255, 255, 100);
-    text(`Balance: ${bal} / 2.00`, 30, yOff); yOff += 18;
-    text(`Cart: ${dispSim.x.toFixed(2)}m`, 30, yOff); yOff += 18;
+  if (isTraining) {
+    // Pulsing green dot
+    let pulse = 150 + Math.sin(frameCount * 0.15) * 105;
+    fill(80, 255, 120, pulse);
+    ellipse(px + 18, trainY + trainH / 2, 8, 8);
+    // Glow ring
+    noFill();
+    stroke(80, 255, 120, pulse * 0.3);
+    strokeWeight(2);
+    ellipse(px + 18, trainY + trainH / 2, 14, 14);
+    noStroke();
+    fill(80, 255, 120, 220);
+    text("TRAINING", px + 30, trainY + trainH / 2);
+  } else {
+    fill(255, 60, 60, 180);
+    ellipse(px + 18, trainY + trainH / 2, 8, 8);
+    fill(255, 60, 60, 180);
+    text("IDLE", px + 30, trainY + trainH / 2);
   }
+
+  // Generation progress bar
+  let barX = px + 110;
+  let barW = panelW - 120;
+  let barH = 6;
+  let barY = trainY + trainH / 2 - barH / 2;
+  let prog = popSize > 0 ? evalIdx / popSize : 0;
+
+  fill(255, 255, 255, 15);
+  rect(barX, barY, barW, barH, 3);
+  if (isTraining) {
+    fill(80, 255, 120, 120);
+  } else {
+    fill(255, 255, 255, 40);
+  }
+  rect(barX, barY, barW * prog, barH, 3);
 
   fill(255, 255, 255, 80);
+  textSize(8);
+  textAlign(RIGHT, CENTER);
+  text(`${evalIdx}/${popSize}`, barX + barW, barY + barH + 8);
+
+  // --- Stats panel ---
+  let sp = trainY + trainH + 10;
+  let statLines = 10;
+  let spH = 17 * statLines + 20;
+
+  noStroke();
+  fill(8, 10, 22, 210);
+  rect(px, sp, panelW, spH, 8);
+  stroke(255, 255, 255, 15);
+  strokeWeight(1);
+  noFill();
+  rect(px, sp, panelW, spH, 8);
+
+  let tx = px + 14;
+  let ty = sp + 14;
+  let lh = 17;
+  noStroke();
+  textFont("monospace");
   textSize(11);
-  text(`Genome: ${GENOME_LEN} params  |  NN: ${NN_IN}-${NN_HID}-${NN_OUT}`, 30, yOff);
+  textAlign(LEFT, TOP);
 
-  // Buttons drawn separately
-  drawButtonBar();
+  fill(255, 255, 255, 60);
+  text("PRESET", tx, ty);
+  fill(255, 255, 255, 180);
+  text(PRESETS[currentPreset].name, tx + 90, ty);
+  ty += lh;
 
-  if (isRecording) {
-    textAlign(RIGHT, TOP);
-    let pulse = 200 + Math.sin(frameCount * 0.1) * 55;
-    fill(255, 40, 40, pulse);
-    noStroke();
-    ellipse(width - 35, 30, 14, 14);
-    fill(255, 255, 255, 180);
-    textSize(13);
-    text("REC", width - 48, 22);
+  fill(255, 255, 255, 60);
+  text("GENERATION", tx, ty);
+  fill(255, 255, 255, 180);
+  text(gen, tx + 90, ty);
+  ty += lh;
+
+  fill(255, 255, 255, 60);
+  text("POP SIZE", tx, ty);
+  fill(255, 255, 255, 140);
+  text(popSize, tx + 90, ty);
+  ty += lh;
+
+  fill(255, 255, 255, 60);
+  text("BEST GEN", tx, ty);
+  fill(120, 255, 120, 180);
+  text(bestFit > -Infinity ? bestFit.toFixed(1) : "---", tx + 90, ty);
+  ty += lh;
+
+  fill(255, 255, 255, 60);
+  text("BEST ALL", tx, ty);
+  fill(255, 200, 50, 200);
+  text(allBestFit > -Infinity ? allBestFit.toFixed(1) : "---", tx + 90, ty);
+  ty += lh;
+
+  fill(255, 255, 255, 60);
+  text("TOTAL EVALS", tx, ty);
+  fill(255, 255, 255, 140);
+  text(totalEvals.toLocaleString(), tx + 90, ty);
+  ty += lh;
+
+  fill(255, 255, 255, 60);
+  text("EVALS/SEC", tx, ty);
+  fill(isTraining ? [80, 200, 255][0] : 255, isTraining ? [80, 200, 255][1] : 255, isTraining ? [80, 200, 255][2] : 255, 160);
+  text(evalsPerSec.toFixed(1), tx + 90, ty);
+  ty += lh;
+
+  fill(255, 255, 255, 60);
+  text("ELAPSED", tx, ty);
+  fill(255, 255, 255, 140);
+  let secs = Math.floor(trainElapsed / 1000);
+  let mins = Math.floor(secs / 60);
+  let hrs = Math.floor(mins / 60);
+  let timeStr = hrs > 0
+    ? `${hrs}h ${mins % 60}m ${secs % 60}s`
+    : mins > 0
+      ? `${mins}m ${secs % 60}s`
+      : `${secs}s`;
+  text(timeStr, tx + 90, ty);
+  ty += lh;
+
+  if (dispSim) {
+    let bal = (1 + Math.cos(dispSim.t1)) / 2 + (1 + Math.cos(dispSim.t2)) / 2;
+    fill(255, 255, 255, 60);
+    text("BALANCE", tx, ty);
+    let bt = bal / 2;
+    fill(lerp(255, 120, bt), lerp(80, 255, bt), lerp(80, 120, bt), 180);
+    text(bal.toFixed(2) + " / 2.00", tx + 90, ty);
+    ty += lh;
+
+    fill(255, 255, 255, 60);
+    text("CART POS", tx, ty);
+    fill(255, 255, 255, 140);
+    text(dispSim.x.toFixed(2) + "m", tx + 90, ty);
+    ty += lh;
+  } else {
+    ty += lh * 2;
   }
 
+  // --- Key hints (bottom-left) ---
+  drawKeyHints();
+
+  // --- Recording indicator ---
+  if (isRecording) {
+    let recX = width / 2;
+    let recY = 20;
+    noStroke();
+    fill(8, 10, 22, 210);
+    rect(recX - 36, recY, 72, 26, 6);
+    let pulse = 200 + Math.sin(frameCount * 0.1) * 55;
+    fill(255, 40, 40, pulse);
+    ellipse(recX - 16, recY + 13, 10, 10);
+    fill(255, 255, 255, 180);
+    textFont("monospace");
+    textSize(11);
+    textAlign(LEFT, CENTER);
+    text("REC", recX - 4, recY + 13);
+  }
+
+  // --- Paused overlay ---
   if (paused) {
+    fill(5, 5, 15, 120);
+    noStroke();
+    rect(0, 0, width, height);
     textAlign(CENTER, CENTER);
-    textSize(28);
-    fill(255, 255, 255, 150);
+    textFont("monospace");
+    textSize(32);
+    fill(255, 255, 255, 200);
     text("PAUSED", width / 2, height / 2);
+    textSize(12);
+    fill(255, 255, 255, 80);
+    text("Press SPACE to resume", width / 2, height / 2 + 30);
   }
 }
 
@@ -713,83 +1062,49 @@ function playImpact() {
 }
 
 // ============================================================
-//  Button UI
+//  Key Hints
 // ============================================================
-const BTN_H = 28;
-const BTN_GAP = 4;
-const BTN_Y_OFF = 48;
-
-function getBtns() {
-  return [
-    { label: paused ? "PLAY" : "PAUSE", action: () => { paused = !paused; }, w: 46 },
-    { label: "RESET", action: () => { loadPreset(currentPreset); }, w: 44 },
-    { label: "1", action: () => loadPreset(0), w: 24, hi: currentPreset === 0 },
-    { label: "2", action: () => loadPreset(1), w: 24, hi: currentPreset === 1 },
-    { label: "3", action: () => loadPreset(2), w: 24, hi: currentPreset === 2 },
-    { label: "4", action: () => loadPreset(3), w: 24, hi: currentPreset === 3 },
-    { label: "5", action: () => loadPreset(4), w: 24, hi: currentPreset === 4 },
-    { label: "TRAIL", action: () => { showTrails = !showTrails; }, w: 42, hi: showTrails },
-    { label: "GRID", action: () => { showGrid = !showGrid; }, w: 38, hi: showGrid },
-    { label: "NN", action: () => { showNN = !showNN; }, w: 28, hi: showNN },
-    { label: "SFX", action: () => { sfxEnabled = !sfxEnabled; if (masterGain) masterGain.gain.value = sfxEnabled ? 0.35 : 0; }, w: 34, hi: sfxEnabled },
-    { label: "POP-", action: () => { popSize = max(10, popSize - 10); loadPreset(currentPreset); }, w: 38 },
-    { label: `P:${popSize}`, action: () => {}, w: 42 },
-    { label: "POP+", action: () => { popSize = min(200, popSize + 10); loadPreset(currentPreset); }, w: 38 },
-    { label: "-", action: () => { speedMultiplier = max(speedMultiplier / 2, 0.25); }, w: 24 },
-    { label: `${speedMultiplier}x`, action: () => {}, w: 38 },
-    { label: "+", action: () => { speedMultiplier = min(speedMultiplier * 2, 16); }, w: 24 },
-    { label: isRecording ? "STOP" : "REC", action: () => { if (isRecording) stopRecording(); else startRecording(); }, w: 38, hi: isRecording },
+function drawKeyHints() {
+  let hints = [
+    ["SPACE", "Pause / Resume"],
+    ["R", "Reset"],
+    ["1-5", "Switch Preset"],
+    ["T", "Toggle Trail" + (showTrails ? "" : "  [off]")],
+    ["G", "Toggle Grid" + (showGrid ? "" : "  [off]")],
+    ["N", "Toggle NN" + (showNN ? "" : "  [off]")],
+    ["A", "Toggle All Agents" + (showAll ? "" : "  [off]")],
+    ["M", "Toggle Audio" + (sfxEnabled ? "" : "  [off]")],
+    ["V", "Record"],
   ];
-}
 
-function drawButtonBar() {
-  let btns = getBtns();
-  let totalW = btns.reduce((s, b) => s + b.w + BTN_GAP, -BTN_GAP);
-  let sx = (width - totalW) / 2;
-  let y = height - BTN_Y_OFF;
+  let lh = 16;
+  let panelH = hints.length * lh + 16;
+  let panelW = 200;
+  let px = 20;
+  let py = height - panelH - 20;
 
   noStroke();
-  fill(10, 12, 25, 190);
-  rect(sx - 10, y - 6, totalW + 20, BTN_H + 12, 8);
+  fill(8, 10, 22, 180);
+  rect(px, py, panelW, panelH, 8);
+  stroke(255, 255, 255, 10);
+  strokeWeight(1);
+  noFill();
+  rect(px, py, panelW, panelH, 8);
 
-  let x = sx;
   textFont("monospace");
   textSize(10);
-  textAlign(CENTER, CENTER);
+  noStroke();
+  let ty = py + 10;
 
-  for (let b of btns) {
-    if (b.hi) {
-      fill(255, 255, 255, 25);
-      stroke(255, 255, 255, 60);
-    } else {
-      fill(255, 255, 255, 8);
-      stroke(255, 255, 255, 25);
-    }
-    strokeWeight(1);
-    rect(x, y, b.w, BTN_H, 4);
-
-    noStroke();
-    fill(255, 255, 255, b.hi ? 200 : 130);
-    text(b.label, x + b.w / 2, y + BTN_H / 2);
-    x += b.w + BTN_GAP;
+  for (let h of hints) {
+    fill(255, 255, 255, 90);
+    textAlign(RIGHT, TOP);
+    text(h[0], px + 50, ty);
+    fill(255, 255, 255, 45);
+    textAlign(LEFT, TOP);
+    text(h[1], px + 58, ty);
+    ty += lh;
   }
-}
-
-function handleBtnClick(mx, my) {
-  if (!audioStarted) initAudio();
-  let btns = getBtns();
-  let totalW = btns.reduce((s, b) => s + b.w + BTN_GAP, -BTN_GAP);
-  let sx = (width - totalW) / 2;
-  let y = height - BTN_Y_OFF;
-  let x = sx;
-  for (let b of btns) {
-    if (mx >= x && mx <= x + b.w && my >= y && my <= y + BTN_H) {
-      b.action();
-      return true;
-    }
-    x += b.w + BTN_GAP;
-  }
-  return false;
 }
 
 // ============================================================
@@ -819,15 +1134,25 @@ function stopRecording() {
 // ============================================================
 function setup() {
   createCanvas(windowWidth, windowHeight);
-  pixelDensity(1);
   textFont("monospace");
+  initWorker();
   loadPreset(currentPreset);
 }
 
 function loadPreset(idx) {
   currentPreset = idx;
-  initPop();
+  gen = 0; evalIdx = 0;
+  bestFit = -Infinity;
+  allBestFit = -Infinity;
+  allBestGenome = null;
+  fitHistory = []; avgFitHistory = [];
+  totalEvals = 0;
+  trainElapsed = 0;
+  evalsPerSec = 0;
+  lastEvalCountTime = millis();
+  topGenomes = [];
   resetDisplay();
+  worker.postMessage({ type: "start", preset: idx, popSize: popSize });
   playImpact();
 }
 
@@ -835,7 +1160,6 @@ function draw() {
   background(5, 5, 15);
 
   if (!paused) {
-    trainBatch();
     stepDisplay();
     updateAudio();
     time += 1 / 60;
@@ -858,17 +1182,16 @@ function keyPressed() {
   if (key === "t" || key === "T") showTrails = !showTrails;
   if (key === "g" || key === "G") showGrid = !showGrid;
   if (key === "n" || key === "N") showNN = !showNN;
+  if (key === "a" || key === "A") showAll = !showAll;
   if (key === "m" || key === "M") {
     sfxEnabled = !sfxEnabled;
     if (masterGain) masterGain.gain.value = sfxEnabled ? 0.35 : 0;
   }
-  if (key === "=" || key === "+") speedMultiplier = min(speedMultiplier * 2, 16);
-  if (key === "-" || key === "_") speedMultiplier = max(speedMultiplier / 2, 0.25);
   if (key === "v" || key === "V") {
     if (isRecording) stopRecording(); else startRecording();
   }
   if (key >= "1" && key <= "5") loadPreset(int(key) - 1);
 }
 
-function mousePressed() { if (!audioStarted) initAudio(); handleBtnClick(mouseX, mouseY); }
+function mousePressed() { if (!audioStarted) initAudio(); }
 function windowResized() { resizeCanvas(windowWidth, windowHeight); }
