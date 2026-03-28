@@ -192,8 +192,8 @@ class CartDP {
     ];
     let b = [
       F - fric * xd + (m1 + m2) * L1 * t1d * t1d * s1 + m2 * L2 * t2d * t2d * s2,
-      -(m1 + m2) * g_acc * L1 * s1 - m2 * L1 * L2 * t2d * t2d * s12,
-      -m2 * g_acc * L2 * s2 + m2 * L1 * L2 * t1d * t1d * s12
+      (m1 + m2) * g_acc * L1 * s1 - m2 * L1 * L2 * t2d * t2d * s12,
+      m2 * g_acc * L2 * s2 + m2 * L1 * L2 * t1d * t1d * s12
     ];
     let acc = solve3(A, b);
     return [xd, acc[0], t1d, acc[1], t2d, acc[2]];
@@ -273,6 +273,8 @@ function evalAgent(genome) {
   let totalR = 0;
   for (let i = 0; i < p.steps; i++) {
     if (sim.dead) break;
+    // Early termination if both arms have fallen past horizontal
+    if (Math.abs(sim.t1) > Math.PI * 0.75 && Math.abs(sim.t2) > Math.PI * 0.75) break;
     let s = sim.state();
     let out = net.forward(s);
     sim.step(out[0] * MAX_FORCE);
