@@ -18,8 +18,7 @@ const NN_OUT = 1;
 const GENOME_LEN = (NN_IN + 1) * NN_HID + (NN_HID + 1) * NN_OUT; // 121
 
 // --- GA ---
-const POP_SIZE = 100;
-const ELITE = 10;
+let popSize = 30;
 const MUT_RATE = 0.15;
 const MUT_STD = 0.35;
 
@@ -33,7 +32,7 @@ let allBestGenome = null;
 let allBestFit = -Infinity;
 let fitHistory = [];
 let avgFitHistory = [];
-let evalsPerFrame = 10;
+let evalsPerFrame = 2;
 
 let dispSim = null;
 let dispNet = null;
@@ -259,7 +258,7 @@ function solve3(A, b) {
 // ============================================================
 function initPop() {
   pop = [];
-  for (let i = 0; i < POP_SIZE; i++) pop.push({ g: NNet.rand(), fit: 0 });
+  for (let i = 0; i < popSize; i++) pop.push({ g: NNet.rand(), fit: 0 });
   gen = 0; evalIdx = 0;
   bestFit = -Infinity; bestGenome = null;
   allBestFit = -Infinity; allBestGenome = null;
@@ -285,7 +284,7 @@ function evalAgent(genome) {
 
 function trainBatch(n) {
   for (let i = 0; i < n; i++) {
-    if (evalIdx >= POP_SIZE) {
+    if (evalIdx >= popSize) {
       nextGen();
       evalIdx = 0;
     }
@@ -297,7 +296,7 @@ function trainBatch(n) {
 function nextGen() {
   pop.sort((a, b) => b.fit - a.fit);
   let topFit = pop[0].fit;
-  let avgFit = pop.reduce((s, a) => s + a.fit, 0) / POP_SIZE;
+  let avgFit = pop.reduce((s, a) => s + a.fit, 0) / popSize;
   fitHistory.push(topFit);
   avgFitHistory.push(avgFit);
 
@@ -307,9 +306,10 @@ function nextGen() {
   // Breed next generation
   let newPop = [];
   // Elitism
-  for (let i = 0; i < ELITE; i++) newPop.push({ g: new Float64Array(pop[i].g), fit: 0 });
+  let elite = Math.max(2, Math.floor(popSize * 0.1));
+  for (let i = 0; i < elite; i++) newPop.push({ g: new Float64Array(pop[i].g), fit: 0 });
   // Breed rest
-  while (newPop.length < POP_SIZE) {
+  while (newPop.length < popSize) {
     let a = tournament(3);
     let b = tournament(3);
     let child = NNet.cross(pop[a].g, pop[b].g);
@@ -322,9 +322,9 @@ function nextGen() {
 }
 
 function tournament(k) {
-  let best = Math.floor(Math.random() * POP_SIZE);
+  let best = Math.floor(Math.random() * popSize);
   for (let i = 1; i < k; i++) {
-    let c = Math.floor(Math.random() * POP_SIZE);
+    let c = Math.floor(Math.random() * popSize);
     if (pop[c].fit > pop[best].fit) best = c;
   }
   return best;
@@ -602,7 +602,7 @@ function drawHUD() {
   textSize(12);
 
   fill(255, 255, 255, 120);
-  text(`Population: ${POP_SIZE}  |  Eval: ${evalIdx}/${POP_SIZE}`, 30, yOff); yOff += 20;
+  text(`Population: ${popSize}  |  Eval: ${evalIdx}/${popSize}`, 30, yOff); yOff += 20;
   fill(120, 255, 120, 150);
   text(`Best (gen): ${bestFit > -Infinity ? bestFit.toFixed(1) : "---"}`, 30, yOff); yOff += 18;
   fill(255, 200, 50, 150);
@@ -727,6 +727,9 @@ function getBtns() {
     { label: "GRID", action: () => { showGrid = !showGrid; }, w: 38, hi: showGrid },
     { label: "NN", action: () => { showNN = !showNN; }, w: 28, hi: showNN },
     { label: "SFX", action: () => { sfxEnabled = !sfxEnabled; if (masterGain) masterGain.gain.value = sfxEnabled ? 0.35 : 0; }, w: 34, hi: sfxEnabled },
+    { label: "POP-", action: () => { popSize = max(10, popSize - 10); loadPreset(currentPreset); }, w: 38 },
+    { label: `P:${popSize}`, action: () => {}, w: 42 },
+    { label: "POP+", action: () => { popSize = min(200, popSize + 10); loadPreset(currentPreset); }, w: 38 },
     { label: "-", action: () => { speedMultiplier = max(speedMultiplier / 2, 0.25); }, w: 24 },
     { label: `${speedMultiplier}x`, action: () => {}, w: 38 },
     { label: "+", action: () => { speedMultiplier = min(speedMultiplier * 2, 16); }, w: 24 },
