@@ -33,6 +33,7 @@ let allBestFit = -Infinity;
 let fitHistory = [];
 let avgFitHistory = [];
 let evalsPerFrame = 2;
+let trainBudgetMs = 8; // max ms to spend training per frame
 
 let dispSim = null;
 let dispNet = null;
@@ -282,14 +283,18 @@ function evalAgent(genome) {
   return totalR;
 }
 
-function trainBatch(n) {
-  for (let i = 0; i < n; i++) {
+function trainBatch() {
+  let deadline = performance.now() + trainBudgetMs * speedMultiplier;
+  let count = 0;
+  while (performance.now() < deadline) {
     if (evalIdx >= popSize) {
       nextGen();
       evalIdx = 0;
     }
     pop[evalIdx].fit = evalAgent(pop[evalIdx].g);
     evalIdx++;
+    count++;
+    if (count >= popSize) break; // at most one full gen per frame
   }
 }
 
@@ -830,8 +835,7 @@ function draw() {
   background(5, 5, 15);
 
   if (!paused) {
-    let batch = Math.round(evalsPerFrame * speedMultiplier);
-    trainBatch(batch);
+    trainBatch();
     stepDisplay();
     updateAudio();
     time += 1 / 60;
